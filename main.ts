@@ -339,8 +339,19 @@ export default class GetNoteSyncPlugin extends Plugin {
 				await this.app.vault.createFolder(folder);
 			}
 
-			// Paginate through all notes
-			while (true) {
+			// Build note_id → file index from metadata cache (covers renamed files)
+				const noteIdIndex = new Map<string, TFile>();
+				if (this.settings.includeMetadata) {
+					for (const file of this.app.vault.getMarkdownFiles()) {
+						if (!file.path.startsWith(folder + "/")) continue;
+						const cache = this.app.metadataCache.getFileCache(file);
+						const id = cache?.frontmatter?.note_id;
+						if (id) noteIdIndex.set(String(id), file);
+					}
+				}
+
+				// Paginate through all notes
+				while (true) {
 				const page = await client.listNotes(cursor);
 
 				for (const note of page.notes) {
@@ -349,15 +360,23 @@ export default class GetNoteSyncPlugin extends Plugin {
 
 					totalFetched++;
 
-					const filename = buildFilename(note, this.settings.noteNameTemplate);
-					const filePath = normalizePath(`${folder}/${filename}.md`);
 					const content = buildMarkdown(note as GetNoteDetail, this.settings.includeMetadata);
 
-					const existing = this.app.vault.getAbstractFileByPath(filePath);
-					if (existing instanceof TFile) {
-						await this.app.vault.modify(existing, content);
+					// Look up by note_id first (survives local renames)
+					const byId = noteIdIndex.get(note.note_id);
+					if (byId) {
+						await this.app.vault.modify(byId, content);
 					} else {
-						await this.app.vault.create(filePath, content);
+						// New note — create at default path
+						const filename = buildFilename(note, this.settings.noteNameTemplate);
+						const filePath = normalizePath(`${folder}/${filename}.md`);
+						const existing = this.app.vault.getAbstractFileByPath(filePath);
+						if (existing instanceof TFile) {
+							await this.app.vault.modify(existing, content);
+						} else {
+							const created = await this.app.vault.create(filePath, content);
+							noteIdIndex.set(note.note_id, created);
+						}
 					}
 					totalWritten++;
 				}
