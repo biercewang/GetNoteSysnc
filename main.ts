@@ -20,6 +20,7 @@ interface GetNoteSyncSettings {
 	noteNameTemplate: string; // "title" | "date-title" | "id-title"
 	includeMetadata: boolean;
 	lastSyncCursor: string; // since_id for incremental sync
+	noteIdIndex: Record<string, string>; // note_id → filePath (persisted, avoids vault scan)
 }
 
 const DEFAULT_SETTINGS: GetNoteSyncSettings = {
@@ -31,6 +32,7 @@ const DEFAULT_SETTINGS: GetNoteSyncSettings = {
 	noteNameTemplate: "title",
 	includeMetadata: true,
 	lastSyncCursor: "0",
+	noteIdIndex: {},
 };
 
 // ─── API Types ────────────────────────────────────────────────────────────────
@@ -339,61 +341,70 @@ export default class GetNoteSyncPlugin extends Plugin {
 				await this.app.vault.createFolder(folder);
 			}
 
-			// Build note_id → file index from metadata cache (covers renamed files)
-				const noteIdIndex = new Map<string, TFile>();
-				if (this.settings.includeMetadata) {
-					for (const file of this.app.vault.getMarkdownFiles()) {
-						if (!file.path.startsWith(folder + "/")) continue;
-						const cache = this.app.metadataCache.getFileCache(file);
-						const id = cache?.frontmatter?.note_id;
-						if (id) noteIdIndex.set(String(id), file);
-					}
+			// Load persisted note_id → filePath index (no vault scan needed)
+			const noteIdIndex = new Map<string, string>(
+				Object.entries(this.settings.noteIdIndex ?? {})
+			);
+
+			// Write a note using direct adapter (faster than vault.create/modify)
+			const writeNote = async (note: GetNoteItem): Promise<void> => {
+				if (note.title?.startsWith("(冲突笔记)")) return;
+
+				totalFetched++;
+				const content = buildMarkdown(note as GetNoteDetail, this.settings.includeMetadata);
+
+				let filePath = noteIdIndex.get(note.note_id);
+
+				// If indexed path no longer exists (deleted/renamed), treat as new
+				if (filePath && !(await this.app.vault.adapter.exists(filePath))) {
+					filePath = undefined;
 				}
 
-				// Paginate through all notes
-				while (true) {
-				const page = await client.listNotes(cursor);
-
-				for (const note of page.notes) {
-					// Skip conflict notes created by Get笔记's own device sync
-					if (note.title?.startsWith("(冲突笔记)")) continue;
-
-					totalFetched++;
-
-					const content = buildMarkdown(note as GetNoteDetail, this.settings.includeMetadata);
-
-					// Look up by note_id first (survives local renames)
-					const byId = noteIdIndex.get(note.note_id);
-					if (byId) {
-						await this.app.vault.modify(byId, content);
-					} else {
-						// New note — create at default path
-						const filename = buildFilename(note, this.settings.noteNameTemplate);
-						const filePath = normalizePath(`${folder}/${filename}.md`);
-						const existing = this.app.vault.getAbstractFileByPath(filePath);
-						if (existing instanceof TFile) {
-							await this.app.vault.modify(existing, content);
-						} else {
-							const created = await this.app.vault.create(filePath, content);
-							noteIdIndex.set(note.note_id, created);
+				if (!filePath) {
+					const filename = buildFilename(note, this.settings.noteNameTemplate);
+					filePath = normalizePath(`${folder}/${filename}.md`);
+					// If default path is taken by a different note, append id
+					if (noteIdIndex.has(note.note_id) === false) {
+						const existing = await this.app.vault.adapter.exists(filePath);
+						if (existing) {
+							filePath = normalizePath(`${folder}/${filename}.${note.note_id}.md`);
 						}
 					}
-					totalWritten++;
+					noteIdIndex.set(note.note_id, filePath);
 				}
 
-				// Update cursor to largest ID seen
-				if (page.notes.length > 0) {
+				await this.app.vault.adapter.write(filePath, content);
+				totalWritten++;
+			};
+
+			// Pipeline: fetch next page while writing current page in parallel
+			let nextPagePromise: Promise<ListResponse> = client.listNotes(cursor);
+
+			while (true) {
+				const page = await nextPagePromise;
+
+				// Immediately start fetching next page (overlaps with writes below)
+				if (page.has_more && page.notes.length > 0) {
+					cursor = page.notes[page.notes.length - 1].note_id;
+					nextPagePromise = client.listNotes(cursor);
+				}
+
+				// Write all notes on this page in parallel
+				await Promise.all(page.notes.map(writeNote));
+
+				if (page.notes.length > 0 && !page.has_more) {
 					cursor = page.notes[page.notes.length - 1].note_id;
 				}
 
 				if (!page.has_more) break;
 			}
 
-			// Save progress
+			// Persist index and cursor
+			this.settings.noteIdIndex = Object.fromEntries(noteIdIndex);
 			if (cursor !== "0") {
 				this.settings.lastSyncCursor = cursor;
-				await this.saveSettings();
 			}
+			await this.saveSettings();
 
 			notice.hide();
 			new Notice(`✅ Synced ${totalFetched} notes (${totalWritten} written) to ${folder}`);
