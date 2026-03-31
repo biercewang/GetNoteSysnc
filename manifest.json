@@ -1,0 +1,10 @@
+{
+  "id": "getnote-sync",
+  "name": "GetNote Sync",
+  "version": "1.0.0",
+  "minAppVersion": "1.0.0",
+  "description": "Sync notes from Get笔记 (biji.com) into your Obsidian vault",
+  "author": "wangbing",
+  "authorUrl": "",
+  "isDesktopOnly": false
+}
