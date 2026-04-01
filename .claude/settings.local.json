@@ -26,7 +26,10 @@
       "Bash(gh repo:*)",
       "Bash(git push:*)",
       "Bash(DATA=\"/Volumes/Disk/MyInfo2026/.obsidian/plugins/getnote-sync/data.json\")",
-      "Bash(python3 -:*)"
+      "Bash(python3 -:*)",
+      "Bash(python3 -c \":*)",
+      "Bash(node -e \"require\\(''''/Volumes/Disk/MyInfo2026/.obsidian/plugins/getnote-sync/main.js''''\\)\")",
+      "Bash(node --check \"/Volumes/Disk/MyInfo2026/.obsidian/plugins/getnote-sync/main.js\")"
     ]
   }
 }

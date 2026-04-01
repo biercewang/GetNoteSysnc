@@ -21,6 +21,7 @@ interface GetNoteSyncSettings {
 	includeMetadata: boolean;
 	lastSyncCursor: string; // since_id for incremental sync
 	noteIdIndex: Record<string, string>; // note_id → filePath (persisted, avoids vault scan)
+	recentDays: number; // days to re-check for updates on every sync
 }
 
 const DEFAULT_SETTINGS: GetNoteSyncSettings = {
@@ -33,6 +34,7 @@ const DEFAULT_SETTINGS: GetNoteSyncSettings = {
 	includeMetadata: true,
 	lastSyncCursor: "0",
 	noteIdIndex: {},
+	recentDays: 3,
 };
 
 // ─── API Types ────────────────────────────────────────────────────────────────
@@ -313,6 +315,25 @@ export default class GetNoteSyncPlugin extends Plugin {
 		await this.saveData(this.settings);
 	}
 
+	/** Find the smallest note_id among local files created within the last N days */
+	private async findRecentCursor(folder: string, days: number): Promise<string | null> {
+		const cutoff = new Date();
+		cutoff.setDate(cutoff.getDate() - days);
+		const cutoffStr = cutoff.toISOString().slice(0, 10); // YYYY-MM-DD
+
+		let minId = "";
+		for (const file of this.app.vault.getMarkdownFiles()) {
+			if (!file.path.startsWith(folder + "/")) continue;
+			const cache = this.app.metadataCache.getFileCache(file);
+			const createdAt: string = cache?.frontmatter?.created_at ?? "";
+			const noteId: string = String(cache?.frontmatter?.note_id ?? "");
+			if (noteId && createdAt.slice(0, 10) >= cutoffStr) {
+				if (!minId || noteId < minId) minId = noteId;
+			}
+		}
+		return minId || null;
+	}
+
 	async syncNotes(fullSync = false) {
 		if (!this.settings.apiKey || !this.settings.clientId) {
 			new Notice("⚠️ Please configure your Get笔记 API Key and Client ID in settings.");
@@ -334,6 +355,7 @@ export default class GetNoteSyncPlugin extends Plugin {
 			let cursor = sinceId;
 			let totalFetched = 0;
 			let totalWritten = 0;
+			let totalSkipped = 0;
 
 			// Ensure sync folder exists
 			const folder = normalizePath(this.settings.syncFolder);
@@ -346,58 +368,91 @@ export default class GetNoteSyncPlugin extends Plugin {
 				Object.entries(this.settings.noteIdIndex ?? {})
 			);
 
-			// Write a note using direct adapter (faster than vault.create/modify)
-			const writeNote = async (note: GetNoteItem): Promise<void> => {
-				if (note.title?.startsWith("(冲突笔记)")) return;
-
-				totalFetched++;
-				const content = buildMarkdown(note as GetNoteDetail, this.settings.includeMetadata);
-
+			/**
+			 * Resolve file path for a note (from index or create new).
+			 * Returns the path and whether the file already existed.
+			 */
+			const resolvePath = async (note: GetNoteItem): Promise<string> => {
 				let filePath = noteIdIndex.get(note.note_id);
-
-				// If indexed path no longer exists (deleted/renamed), treat as new
 				if (filePath && !(await this.app.vault.adapter.exists(filePath))) {
 					filePath = undefined;
 				}
-
 				if (!filePath) {
 					const filename = buildFilename(note, this.settings.noteNameTemplate);
 					filePath = normalizePath(`${folder}/${filename}.md`);
-					// If default path is taken by a different note, append id
-					if (noteIdIndex.has(note.note_id) === false) {
-						const existing = await this.app.vault.adapter.exists(filePath);
-						if (existing) {
-							filePath = normalizePath(`${folder}/${filename}.${note.note_id}.md`);
-						}
+					if (await this.app.vault.adapter.exists(filePath)) {
+						filePath = normalizePath(`${folder}/${filename}.${note.note_id}.md`);
 					}
 					noteIdIndex.set(note.note_id, filePath);
 				}
+				return filePath;
+			};
 
+			/** Always write (new notes pass) */
+			const writeNote = async (note: GetNoteItem): Promise<void> => {
+				if (note.title?.startsWith("(冲突笔记)")) return;
+				totalFetched++;
+				const filePath = await resolvePath(note);
+				const content = buildMarkdown(note as GetNoteDetail, this.settings.includeMetadata);
 				await this.app.vault.adapter.write(filePath, content);
 				totalWritten++;
 			};
 
-			// Pipeline: fetch next page while writing current page in parallel
-			let nextPagePromise: Promise<ListResponse> = client.listNotes(cursor);
+			/** Compare before write (recent notes pass) */
+			const compareAndWrite = async (note: GetNoteItem): Promise<void> => {
+				if (note.title?.startsWith("(冲突笔记)")) return;
+				totalFetched++;
+				const filePath = await resolvePath(note);
+				const newContent = buildMarkdown(note as GetNoteDetail, this.settings.includeMetadata);
 
-			while (true) {
-				const page = await nextPagePromise;
-
-				// Immediately start fetching next page (overlaps with writes below)
-				if (page.has_more && page.notes.length > 0) {
-					cursor = page.notes[page.notes.length - 1].note_id;
-					nextPagePromise = client.listNotes(cursor);
+				// Read existing file and compare; skip write if identical
+				const fileExists = await this.app.vault.adapter.exists(filePath);
+				if (fileExists) {
+					const existing = await this.app.vault.adapter.read(filePath);
+					if (existing === newContent) {
+						totalSkipped++;
+						return;
+					}
 				}
+				await this.app.vault.adapter.write(filePath, newContent);
+				totalWritten++;
+			};
 
-				// Write all notes on this page in parallel
-				await Promise.all(page.notes.map(writeNote));
-
-				if (page.notes.length > 0 && !page.has_more) {
-					cursor = page.notes[page.notes.length - 1].note_id;
+			/** Paginate through API with pipeline fetch + parallel writes */
+			const paginate = async (
+				fromCursor: string,
+				handler: (note: GetNoteItem) => Promise<void>
+			): Promise<string> => {
+				let cur = fromCursor;
+				let nextPage: Promise<ListResponse> = client.listNotes(cur);
+				while (true) {
+					const page = await nextPage;
+					if (page.has_more && page.notes.length > 0) {
+						cur = page.notes[page.notes.length - 1].note_id;
+						nextPage = client.listNotes(cur);
+					}
+					await Promise.all(page.notes.map(handler));
+					if (page.notes.length > 0 && !page.has_more) {
+						cur = page.notes[page.notes.length - 1].note_id;
+					}
+					if (!page.has_more) break;
 				}
+				return cur;
+			};
 
-				if (!page.has_more) break;
+			// ── Phase 1: Re-check recent N days for updates ──────────────────────
+			if (!fullSync && this.settings.recentDays > 0) {
+				const recentCursor = await this.findRecentCursor(folder, this.settings.recentDays);
+				if (recentCursor) {
+					// Use a cursor one step before to include the boundary note
+					const prevCursor = String(BigInt(recentCursor) - BigInt(1));
+					await paginate(prevCursor, compareAndWrite);
+				}
 			}
+
+			// ── Phase 2: Fetch truly new notes (after last cursor) ───────────────
+			const newCursor = await paginate(cursor, writeNote);
+			if (newCursor !== "0") cursor = newCursor;
 
 			// Persist index and cursor
 			this.settings.noteIdIndex = Object.fromEntries(noteIdIndex);
@@ -407,7 +462,9 @@ export default class GetNoteSyncPlugin extends Plugin {
 			await this.saveSettings();
 
 			notice.hide();
-			new Notice(`✅ Synced ${totalFetched} notes (${totalWritten} written) to ${folder}`);
+			new Notice(
+				`✅ ${totalWritten} 条已更新，${totalSkipped} 条无变化，共处理 ${totalFetched} 条`
+			);
 		} catch (err) {
 			notice.hide();
 			const msg = err instanceof Error ? err.message : String(err);
@@ -505,6 +562,20 @@ class GetNoteSyncSettingTab extends PluginSettingTab {
 					.setValue(this.plugin.settings.includeMetadata)
 					.onChange(async (value) => {
 						this.plugin.settings.includeMetadata = value;
+						await this.plugin.saveSettings();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName("近期更新检查天数")
+			.setDesc("每次同步时重新拉取最近 N 天创建的笔记，与本地对比，有差异才落档（0 = 不检查）")
+			.addSlider((slider) =>
+				slider
+					.setLimits(0, 14, 1)
+					.setValue(this.plugin.settings.recentDays)
+					.setDynamicTooltip()
+					.onChange(async (value) => {
+						this.plugin.settings.recentDays = value;
 						await this.plugin.saveSettings();
 					})
 			);
