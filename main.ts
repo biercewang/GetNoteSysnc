@@ -20,8 +20,8 @@ interface GetNoteSyncSettings {
 	noteNameTemplate: string; // "title" | "date-title" | "id-title"
 	includeMetadata: boolean;
 	lastSyncCursor: string; // since_id for incremental sync
-	noteIdIndex: Record<string, string>; // note_id → filePath (persisted, avoids vault scan)
 	recentDays: number; // days to re-check for updates on every sync
+	// noteIdIndex removed — stored in separate note-index.json
 }
 
 const DEFAULT_SETTINGS: GetNoteSyncSettings = {
@@ -33,7 +33,6 @@ const DEFAULT_SETTINGS: GetNoteSyncSettings = {
 	noteNameTemplate: "title",
 	includeMetadata: true,
 	lastSyncCursor: "0",
-	noteIdIndex: {},
 	recentDays: 3,
 };
 
@@ -246,9 +245,28 @@ function buildFilename(
 
 // ─── Main Plugin ─────────────────────────────────────────────────────────────
 
+/** Path (relative to vault root) for the large index file */
+const INDEX_FILE = ".obsidian/plugins/getnote-sync/note-index.json";
+
 export default class GetNoteSyncPlugin extends Plugin {
 	settings!: GetNoteSyncSettings;
 	private autoSyncTimer: ReturnType<typeof setInterval> | null = null;
+
+	/** Load note_id → filePath index from its own file (lazy, not in data.json) */
+	async loadNoteIndex(): Promise<Map<string, string>> {
+		try {
+			const raw = await this.app.vault.adapter.read(INDEX_FILE);
+			return new Map(Object.entries(JSON.parse(raw)));
+		} catch {
+			return new Map();
+		}
+	}
+
+	/** Persist index to its own file */
+	async saveNoteIndex(index: Map<string, string>): Promise<void> {
+		const obj = Object.fromEntries(index);
+		await this.app.vault.adapter.write(INDEX_FILE, JSON.stringify(obj));
+	}
 
 	async onload() {
 		await this.loadSettings();
@@ -363,10 +381,8 @@ export default class GetNoteSyncPlugin extends Plugin {
 				await this.app.vault.createFolder(folder);
 			}
 
-			// Load persisted note_id → filePath index (no vault scan needed)
-			const noteIdIndex = new Map<string, string>(
-				Object.entries(this.settings.noteIdIndex ?? {})
-			);
+			// Load persisted note_id → filePath index from separate file
+			const noteIdIndex = await this.loadNoteIndex();
 
 			/**
 			 * Resolve file path for a note (from index or create new).
@@ -379,9 +395,16 @@ export default class GetNoteSyncPlugin extends Plugin {
 				}
 				if (!filePath) {
 					const filename = buildFilename(note, this.settings.noteNameTemplate);
-					filePath = normalizePath(`${folder}/${filename}.md`);
+					// Place in YYYY/MM subfolder based on created_at
+					const dateStr = note.created_at?.slice(0, 7) ?? ""; // "YYYY-MM"
+					const [year, month] = dateStr ? dateStr.split("-") : ["unknown", "unknown"];
+					const subFolder = normalizePath(`${folder}/${year || "unknown"}/${month || "unknown"}`);
+					if (!(await this.app.vault.adapter.exists(subFolder))) {
+						await this.app.vault.createFolder(subFolder);
+					}
+					filePath = normalizePath(`${subFolder}/${filename}.md`);
 					if (await this.app.vault.adapter.exists(filePath)) {
-						filePath = normalizePath(`${folder}/${filename}.${note.note_id}.md`);
+						filePath = normalizePath(`${subFolder}/${filename}.${note.note_id}.md`);
 					}
 					noteIdIndex.set(note.note_id, filePath);
 				}
@@ -454,8 +477,8 @@ export default class GetNoteSyncPlugin extends Plugin {
 			const newCursor = await paginate(cursor, writeNote);
 			if (newCursor !== "0") cursor = newCursor;
 
-			// Persist index and cursor
-			this.settings.noteIdIndex = Object.fromEntries(noteIdIndex);
+			// Persist index to its own file, cursor to data.json
+			await this.saveNoteIndex(noteIdIndex);
 			if (cursor !== "0") {
 				this.settings.lastSyncCursor = cursor;
 			}
