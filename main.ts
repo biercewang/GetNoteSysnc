@@ -417,8 +417,9 @@ export default class GetNoteSyncPlugin extends Plugin {
 				// Skip notes before 2014
 				if (note.created_at && note.created_at.slice(0, 4) < "2014") return true;
 				// Skip notes with content under 200 characters
-				const contentLen = (note.content ?? "").length;
-				if (contentLen < 200) return true;
+				if ((note.content ?? "").length < 200) return true;
+				// Skip notes tagged with #得到
+				if ((note.content ?? "").includes("#得到") || (note.title ?? "").includes("#得到")) return true;
 				return false;
 			};
 
