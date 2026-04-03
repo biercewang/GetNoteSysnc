@@ -411,9 +411,20 @@ export default class GetNoteSyncPlugin extends Plugin {
 				return filePath;
 			};
 
+			/** Returns true if this note should be skipped */
+			const shouldSkip = (note: GetNoteItem): boolean => {
+				if (note.title?.startsWith("(冲突笔记)")) return true;
+				// Skip notes before 2014
+				if (note.created_at && note.created_at.slice(0, 4) < "2014") return true;
+				// Skip notes with content under 200 characters
+				const contentLen = (note.content ?? "").length;
+				if (contentLen < 200) return true;
+				return false;
+			};
+
 			/** Always write (new notes pass) */
 			const writeNote = async (note: GetNoteItem): Promise<void> => {
-				if (note.title?.startsWith("(冲突笔记)")) return;
+				if (shouldSkip(note)) return;
 				totalFetched++;
 				const filePath = await resolvePath(note);
 				const content = buildMarkdown(note as GetNoteDetail, this.settings.includeMetadata);
@@ -423,7 +434,7 @@ export default class GetNoteSyncPlugin extends Plugin {
 
 			/** Compare before write (recent notes pass) */
 			const compareAndWrite = async (note: GetNoteItem): Promise<void> => {
-				if (note.title?.startsWith("(冲突笔记)")) return;
+				if (shouldSkip(note)) return;
 				totalFetched++;
 				const filePath = await resolvePath(note);
 				const newContent = buildMarkdown(note as GetNoteDetail, this.settings.includeMetadata);
